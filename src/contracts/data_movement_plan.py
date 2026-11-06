@@ -367,6 +367,13 @@ class DmsReplication(BaseModel):
         ),
     )
     sizing: DmsSizing = Field(..., description="The replication instance chosen from the catalog")
+    engine_version: str | None = Field(
+        None,
+        description="The replication instance's DMS engine version; None in a plan written before 1.3",
+    )
+    engine_version_why: str | None = Field(
+        None, description="Why that engine version (the catalog's reason); None with it"
+    )
     multi_az_default: bool = Field(
         True, description="The stack's MultiAZ default (the cost prices it)"
     )
