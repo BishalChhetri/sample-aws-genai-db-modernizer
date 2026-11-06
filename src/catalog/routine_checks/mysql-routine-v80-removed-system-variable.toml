@@ -1,0 +1,21 @@
+# Routine check mysql-routine-v80-removed-system-variable (#1952). Fields: src/shared/catalog/routine_checks.py.
+# Source: MySQL 8.0 Reference Manual, What Is New in MySQL 8.0 (Features Removed: tx_isolation and tx_read_only, the query cache variables, old_passwords, secure_auth, log_warnings).
+id = "mysql-routine-v80-removed-system-variable"
+feature = "A system variable MySQL 8.0 removed"
+source_engines = ["mysql"]
+targets = ["aurora_mysql"]
+kinds = ["procedure", "function", "trigger", "event"]
+impact = "needs_rewrite"
+reason = "The routine sets or reads a system variable MySQL 8.0 removed, so on Aurora MySQL 3 and later the statement fails with an unknown system variable when the routine runs."
+fix_hint = "Use the 8.0 name (transaction_isolation for tx_isolation, transaction_read_only for tx_read_only, log_error_verbosity for log_warnings), or drop the statement for a variable with no replacement (the query cache, old_passwords, secure_auth)."
+docs = "MySQL 8.0 Reference Manual, What Is New in MySQL 8.0 (Features Removed in MySQL 8.0); Server System Variables"
+
+[version_change]
+line = "8.0"
+
+[match]
+system_variables = [
+  "tx_isolation", "tx_read_only", "query_cache_type", "query_cache_size", "query_cache_limit",
+  "query_cache_min_res_unit", "query_cache_wlock_invalidate", "old_passwords", "secure_auth",
+  "log_warnings",
+]

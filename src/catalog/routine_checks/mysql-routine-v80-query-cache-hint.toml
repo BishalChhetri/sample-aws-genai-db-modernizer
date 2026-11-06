@@ -1,0 +1,17 @@
+# Routine check mysql-routine-v80-query-cache-hint (#1952). Fields: src/shared/catalog/routine_checks.py.
+# Source: MySQL 8.0 Reference Manual, What Is New in MySQL 8.0 (Features Removed: the query cache and the SQL_CACHE modifier).
+id = "mysql-routine-v80-query-cache-hint"
+feature = "The SQL_CACHE modifier, removed in MySQL 8.0"
+source_engines = ["mysql"]
+targets = ["aurora_mysql"]
+kinds = ["procedure", "function", "trigger", "event"]
+impact = "needs_rewrite"
+reason = "MySQL 8.0 removed the query cache and its SQL_CACHE modifier, so on Aurora MySQL 3 and later a SELECT with SQL_CACHE no longer parses and the routine cannot be created."
+fix_hint = "Drop SQL_CACHE from the SELECT; cache the result in the application or in Amazon ElastiCache if the routine relied on it."
+docs = "MySQL 8.0 Reference Manual, What Is New in MySQL 8.0 (Features Removed in MySQL 8.0)"
+
+[version_change]
+line = "8.0"
+
+[match]
+statement_contains = ["SQL_CACHE"]

@@ -87,7 +87,9 @@ def _deps(verdict: RoutineVerdict) -> list[str]:
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=lambda e: e["file"])
 def test_each_corpus_routine_gets_its_expected_verdict(entry: dict[str, Any]) -> None:
-    verdict = _check(_routine(entry), target_user=TARGET_USER)
+    verdict = _check(
+        _routine(entry), target_user=TARGET_USER, source_version=entry.get("source_version")
+    )
     assert verdict.status == entry["status"]
     assert verdict.parsed is entry["parsed"]
     assert _ids(verdict) == entry["findings"]
@@ -512,6 +514,8 @@ def test_the_bundled_routine_rules_load_and_validate() -> None:
         "statement",
         "sql_mode",
         "dynamic_sql",
+        "reserved_word",
+        "group_by",
         "dependencies",
     }
     for rule in mysql:
@@ -699,6 +703,15 @@ SQLGLOT_CANNOT_READ = {
     "dynamic-sql-literal.sql": "error",
     "dynamic-sql-variable.sql": "error",
     "kill.sql": "error",
+    # The MySQL 5.7 routines (#1952): IN parameters, DECLARE, cursors, events, and the
+    # syntax 8.0 removed (GROUP BY ... DESC, SQL_CACHE).
+    "v57-clean.sql": "error",
+    "v57-reserved-words.sql": "error",
+    "v57-found-rows.sql": "error",
+    "v57-group-by.sql": "error",
+    "v57-removed-functions.sql": "error",
+    "v57-sql-cache.sql": "command",
+    "v57-removed-variables.sql": "partial",
 }
 
 
@@ -729,9 +742,11 @@ def test_sqlglot_alone_does_not_tell_a_broken_body_from_a_valid_one() -> None:
         assert _sqlglot_reading(stmt) in {"error", "full"}, entry["file"]
 
 
+@pytest.mark.passes_on_main
 def test_every_dml_statement_of_the_parsed_corpus_reads_with_sqlglot() -> None:
     """The other half: once the reader has split a body, sqlglot reads every statement it
-    gets in the corpus (only the dynamic-SQL routine's dependencies stay incomplete)."""
+    gets in the corpus (only the dynamic-SQL routines' dependencies stay incomplete, and
+    those of the 5.7 routines whose statements use syntax or functions 8.0 removed, #1952)."""
     incomplete = [
         e["file"] for e in MANIFEST if e["parsed"] and not e.get("dependencies_complete", True)
     ]
@@ -739,6 +754,9 @@ def test_every_dml_statement_of_the_parsed_corpus_reads_with_sqlglot() -> None:
         "dynamic-sql.sql",
         "dynamic-sql-literal.sql",
         "dynamic-sql-variable.sql",
+        "v57-group-by.sql",
+        "v57-removed-functions.sql",
+        "v57-sql-cache.sql",
     ]
 
 

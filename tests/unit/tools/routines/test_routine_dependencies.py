@@ -129,7 +129,10 @@ def test_the_dependency_check_shows_in_the_verdict_and_unknown_does_not_block() 
         kind="procedure",
         create_sql="CREATE PROCEDURE p() BEGIN PREPARE s FROM @q; EXECUTE s; END",
     )
-    verdict = check_mysql_routine(routine, target_engine="aurora_mysql", target_user="admin")
+    # A same-major source, so no version-change rule (#1952) is in the verdict.
+    verdict = check_mysql_routine(
+        routine, target_engine="aurora_mysql", target_user="admin", source_version="8.0.36"
+    )
     node = mysql_node(routine, verdict)
     assert not node.dependencies_complete
     checked = with_dependency_check(verdict, node, MovedObjects())
