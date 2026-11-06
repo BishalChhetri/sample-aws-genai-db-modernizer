@@ -45,6 +45,30 @@ _SYSTEM_SCHEMAS_FILTER = (
 )
 
 
+# #1652: the offline script's section 10b, the counts the engine keeps per routine.
+_ROUTINE_STATS_SQL = """
+    SELECT OBJECT_NAME(x.object_id, x.database_id) AS routine_name,
+           OBJECT_SCHEMA_NAME(x.object_id, x.database_id) AS schema_name,
+           x.object_type,
+           SUM(x.execution_count) AS execution_count,
+           CAST(SUM(x.total_elapsed_time) / 1000.0 AS DECIMAL(18, 3)) AS total_time_ms
+    FROM (
+        SELECT object_id, database_id, 'PROCEDURE' AS object_type,
+               execution_count, total_elapsed_time
+        FROM sys.dm_exec_procedure_stats WHERE database_id = DB_ID()
+        UNION ALL
+        SELECT object_id, database_id, 'FUNCTION',
+               execution_count, total_elapsed_time
+        FROM sys.dm_exec_function_stats WHERE database_id = DB_ID()
+        UNION ALL
+        SELECT object_id, database_id, 'TRIGGER',
+               execution_count, total_elapsed_time
+        FROM sys.dm_exec_trigger_stats WHERE database_id = DB_ID()
+    ) x
+    WHERE OBJECT_NAME(x.object_id, x.database_id) IS NOT NULL
+    GROUP BY x.object_id, x.database_id, x.object_type
+"""
+
 # The plan cache entries the statement query and both sampling snapshots read (#1908):
 # this database's statements (or unresolved ones), without RDS's and SQL Server's own.
 _STATEMENT_FILTER = """
@@ -328,7 +352,9 @@ class SQLServerRemoteCollector:
                     WHEN 'TF' THEN 'TABLE_FUNCTION'
                     ELSE 'OTHER'
                 END AS routine_type,
-                'TSQL' AS language
+                'TSQL' AS language,
+                -- #1652: NULL for an encrypted module or one the user may not see
+                OBJECT_DEFINITION(o.object_id) AS definition
             FROM sys.objects o
             INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
             WHERE o.type IN ('P', 'FN', 'IF', 'TF')
@@ -354,7 +380,11 @@ class SQLServerRemoteCollector:
                 -- #1651: every event the trigger fires on, e.g. 'INSERT,UPDATE'
                 STUFF((SELECT ',' + te.type_desc FROM sys.trigger_events te
                        WHERE te.object_id = tr.object_id ORDER BY te.type
-                       FOR XML PATH('')), 1, 1, '') AS events
+                       FOR XML PATH('')), 1, 1, '') AS events,
+                -- #1652: once per statement; its state and its body
+                'STATEMENT' AS for_each,
+                CASE WHEN tr.is_disabled = 1 THEN 0 ELSE 1 END AS is_enabled,
+                OBJECT_DEFINITION(tr.object_id) AS definition
             FROM sys.triggers tr
             -- sys.objects, not sys.tables: an INSTEAD OF trigger can sit on a view (#1651)
             INNER JOIN sys.objects t ON tr.parent_id = t.object_id AND t.type IN ('U', 'V')
@@ -628,6 +658,16 @@ class SQLServerRemoteCollector:
         except Exception:  # noqa: BLE001 -- no uptime: the rates fall back to 24 hours
             return None
         return server_window(uptime_seconds=first_row_figure(rows, "uptime_seconds"))
+
+    def collect_routine_stats(self) -> tuple[list[dict], dict]:
+        """The execution counts the engine keeps for each cached procedure, function and
+        trigger (#1652), from in-memory DMVs, and how they were read: ``([],
+        not_tracked)`` without VIEW SERVER STATE. The offline script's section 10b. No
+        setting is changed."""
+        perm = self._query("SELECT HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE') AS ok")
+        if not perm or int(perm[0].get("ok") or 0) != 1:
+            return [], {"status": "not_tracked", "reason": "VIEW SERVER STATE is not granted"}
+        return self._query(_ROUTINE_STATS_SQL), {"status": "tracked"}
 
     def collect_query_routines(self) -> dict[str, list[str]] | None:
         """``{query_hash: [routine_id, ...]}``: the procedures, functions and triggers each

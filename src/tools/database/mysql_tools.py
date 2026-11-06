@@ -33,6 +33,136 @@ from src.tools.sql.query_type import statement_query_type
 logger = logging.getLogger(__name__)
 
 
+# #1652: the collection script's routine sections (``scripts/collect-mysql.sql``), for
+# the live collector, with DATABASE() for ``@db``; ``{flag}`` is 1 or 0
+# (``include_routine_bodies``). Catalog reads only: no SHOW, no setting changed.
+_PROCEDURES_SQL = """
+    SELECT routine_name AS routine_name,
+           routine_schema AS schema_name,
+           specific_name AS specific_name,
+           routine_type AS routine_type,
+           data_type AS return_type,
+           definer AS definer,
+           security_type AS security_type,
+           is_deterministic AS is_deterministic,
+           sql_data_access AS sql_data_access,
+           routine_comment AS routine_comment,
+           external_language AS external_language,
+           sql_mode AS sql_mode,
+           character_set_client AS character_set_client,
+           collation_connection AS collation_connection,
+           database_collation AS database_collation,
+           CHAR_LENGTH(routine_definition) AS body_chars,
+           IF({flag} = 1, routine_definition, NULL) AS definition,
+           CASE WHEN {flag} = 0 THEN 'opted_out'
+                WHEN routine_definition IS NULL THEN 'not_readable'
+                ELSE 'collected' END AS body_status
+    FROM information_schema.routines
+    WHERE routine_schema = DATABASE()
+    ORDER BY routine_type, routine_name
+"""
+
+_TRIGGERS_SQL = """
+    SELECT trigger_name AS trigger_name,
+           trigger_schema AS schema_name,
+           event_manipulation AS event_type,
+           event_object_table AS table_name,
+           action_timing AS timing,
+           action_orientation AS for_each,
+           sql_mode AS sql_mode,
+           definer AS definer,
+           action_order AS action_order,
+           character_set_client AS character_set_client,
+           collation_connection AS collation_connection,
+           database_collation AS database_collation,
+           CHAR_LENGTH(action_statement) AS body_chars,
+           IF({flag} = 1, action_statement, NULL) AS definition,
+           IF({flag} = 1, 'collected', 'opted_out') AS body_status
+    FROM information_schema.triggers
+    WHERE trigger_schema = DATABASE()
+    ORDER BY event_object_table, trigger_name
+"""
+
+_PARAMETERS_SQL = """
+    SELECT specific_name AS routine_name,
+           specific_schema AS schema_name,
+           routine_type AS routine_type,
+           ordinal_position AS ordinal,
+           parameter_mode AS mode,
+           parameter_name AS parameter_name,
+           data_type AS data_type,
+           dtd_identifier AS dtd_identifier,
+           character_set_name AS character_set_name,
+           collation_name AS collation_name
+    FROM information_schema.parameters
+    WHERE specific_schema = DATABASE()
+    ORDER BY routine_type, specific_name, ordinal_position
+"""
+
+_EVENTS_SQL = """
+    SELECT event_name AS event_name,
+           event_schema AS schema_name,
+           definer AS definer,
+           time_zone AS time_zone,
+           event_type AS event_type,
+           DATE_FORMAT(execute_at, '%Y-%m-%d %H:%i:%s') AS execute_at,
+           CAST(interval_value AS CHAR) AS interval_value,
+           interval_field AS interval_field,
+           DATE_FORMAT(starts, '%Y-%m-%d %H:%i:%s') AS starts,
+           DATE_FORMAT(ends, '%Y-%m-%d %H:%i:%s') AS ends,
+           status AS status,
+           on_completion AS on_completion,
+           event_comment AS event_comment,
+           sql_mode AS sql_mode,
+           character_set_client AS character_set_client,
+           collation_connection AS collation_connection,
+           database_collation AS database_collation,
+           CHAR_LENGTH(event_definition) AS body_chars,
+           IF({flag} = 1, event_definition, NULL) AS definition,
+           IF({flag} = 1, 'collected', 'opted_out') AS body_status
+    FROM information_schema.events
+    WHERE event_schema = DATABASE()
+    ORDER BY event_name
+"""
+
+_ROUTINES_COUNTED_SQL = """
+    SELECT (SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = DATABASE())
+         + (SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = DATABASE())
+         + (SELECT COUNT(*) FROM information_schema.events WHERE event_schema = DATABASE()) AS n
+"""
+
+_GRANTEE = (
+    "CONCAT('''', SUBSTRING_INDEX(CURRENT_USER(), '@', 1), '''@''', "
+    "SUBSTRING_INDEX(CURRENT_USER(), '@', -1), '''')"
+)
+_PRIVILEGES_NOT_SEEN_SQL = f"""
+    SELECT p.privilege FROM (
+      SELECT 'SHOW_ROUTINE' AS privilege UNION ALL SELECT 'TRIGGER' UNION ALL SELECT 'EVENT'
+    ) AS p
+    WHERE NOT EXISTS (
+            SELECT 1 FROM information_schema.user_privileges u
+             WHERE u.grantee = {_GRANTEE}
+               AND (u.privilege_type = p.privilege
+                    OR (p.privilege = 'SHOW_ROUTINE' AND u.privilege_type = 'SELECT')))
+      AND NOT EXISTS (
+            SELECT 1 FROM information_schema.schema_privileges s
+             WHERE s.grantee = {_GRANTEE} AND s.table_schema = DATABASE()
+               AND s.privilege_type = p.privilege)
+"""  # nosec B608 -- fixed text, no input
+
+_PROGRAM_STATS_SQL = """
+    SELECT OBJECT_NAME AS routine_name, OBJECT_SCHEMA AS schema_name,
+           OBJECT_TYPE AS object_type, COUNT_STAR AS execution_count,
+           ROUND(SUM_TIMER_WAIT / 1000000000, 3) AS total_time_ms
+    FROM performance_schema.events_statements_summary_by_program
+    WHERE OBJECT_SCHEMA = DATABASE()
+"""
+_NO_PROGRAM_STATS = {
+    "status": "not_tracked",
+    "reason": "performance_schema program statistics are not available",
+}
+
+
 class MySQLRemoteCollector:
     """Collects MySQL metadata via SSM Run Command on an automation instance."""
 
@@ -232,24 +362,53 @@ class MySQLRemoteCollector:
             ORDER BY table_name
         """)
 
-    def collect_procedures(self) -> list[dict]:
-        return self._query("""
-            SELECT routine_name, routine_type, data_type AS return_type,
-                   routine_definition AS definition, sql_mode
-            FROM information_schema.routines
-            WHERE routine_schema = DATABASE()
-            ORDER BY routine_type, routine_name
-        """)
+    def collect_procedures(self, include_bodies: bool = True) -> list[dict]:
+        """Routines with the catalog columns their CREATE is rebuilt from, and whether
+        the user could read each body (#1652); ``include_bodies=False`` reads none."""
+        flag = 1 if include_bodies else 0
+        return self._query(_PROCEDURES_SQL.format(flag=flag))  # nosec B608 -- flag is 0 or 1
 
-    def collect_triggers(self) -> list[dict]:
-        return self._query("""
-            SELECT trigger_name, event_manipulation AS event_type,
-                   event_object_table AS table_name,
-                   action_timing AS timing, action_statement AS definition, sql_mode
-            FROM information_schema.triggers
-            WHERE trigger_schema = DATABASE()
-            ORDER BY event_object_table, trigger_name
-        """)
+    def collect_triggers(self, include_bodies: bool = True) -> list[dict]:
+        """Triggers (listed only with the TRIGGER privilege) with their orientation,
+        DEFINER and order (#1652); ``include_bodies=False`` reads no body."""
+        flag = 1 if include_bodies else 0
+        return self._query(_TRIGGERS_SQL.format(flag=flag))  # nosec B608 -- flag is 0 or 1
+
+    def collect_routine_parameters(self) -> list[dict]:
+        """Each routine's parameters and a function's return type, ordinal 0 (#1652)."""
+        return self._query(_PARAMETERS_SQL)
+
+    def collect_events(self, include_bodies: bool = True) -> list[dict]:
+        """The scheduled events (listed only with the EVENT privilege, #1652)."""
+        flag = 1 if include_bodies else 0
+        return self._query(_EVENTS_SQL.format(flag=flag))  # nosec B608 -- flag is 0 or 1
+
+    def collect_routine_capture(self) -> dict:
+        """The server's routine count and the visibility privileges not granted to the
+        collection user directly (#1652): a hint, never a failure."""
+        counted = self._query(_ROUTINES_COUNTED_SQL)
+        missing = self._query(_PRIVILEGES_NOT_SEEN_SQL)
+        return {
+            "routines_counted": int(counted[0]["n"]) if counted else None,
+            "privileges_not_seen": sorted(
+                {str(r["privilege"]) for r in missing if r.get("privilege")}
+            ),
+        }
+
+    def collect_routine_stats(self) -> tuple[list[dict], dict]:
+        """Per-program execution counts (#1652), read only when performance_schema has
+        them, and how they were read; no setting is changed."""
+        exists = self._query(
+            "SELECT COUNT(*) AS n FROM information_schema.tables "
+            "WHERE table_schema = 'performance_schema' "
+            "AND table_name = 'events_statements_summary_by_program'"
+        )
+        if not exists or int(exists[0].get("n") or 0) == 0:
+            return [], dict(_NO_PROGRAM_STATS)
+        enabled = self._query("SELECT @@performance_schema AS ps")
+        if not enabled or int(enabled[0].get("ps") or 0) != 1:
+            return [], {"status": "not_tracked", "reason": "performance_schema is off"}
+        return self._query(_PROGRAM_STATS_SQL), {"status": "tracked"}
 
     def stats_window(self) -> ServerWindow | None:
         """The window the server's statement counters cover (#1893): its ``Uptime``

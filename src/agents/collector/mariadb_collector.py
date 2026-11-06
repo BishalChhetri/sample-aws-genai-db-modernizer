@@ -36,6 +36,7 @@ from src.agents.collector.mysql_collector import (
     _init_checkpoint_store,
     _live_os_stats,
     _merge_into_queries,
+    live_routine_fields,
 )
 from src.contracts.collector_input import CollectionMode, CollectorInput
 from src.contracts.collector_output import CollectorOutputContract
@@ -107,7 +108,10 @@ def _collect_live_mariadb_stages(inp: CollectorInput, ckpt) -> CollectorOutputCo
         },
     )
     use_span_settings(span_settings("mariadb", meta_raw.get("settings")))
-    schema_raw = ckpt.load_or_run("schema", lambda: _collect_schema_raw(db))
+    # #1652: the opt-out reads no routine body; MariaDB keeps no routine sources (it is
+    # not a same-family source of an Aurora engine), only each routine's body status.
+    include = inp.collection_options.include_routine_bodies
+    schema_raw = ckpt.load_or_run("schema", lambda: _collect_schema_raw(db, include_bodies=include))
     queries_raw = ckpt.load_or_run(
         "queries", lambda: _collect_queries_raw(db, inp.collection_options)
     )
@@ -160,4 +164,5 @@ def _collect_live_mariadb_stages(inp: CollectorInput, ckpt) -> CollectorOutputCo
         triggers=schema_triggers,
         settings=meta_raw.get("settings"),
         query_capture=live_query_capture(len(queries_raw), inp.collection_options, query_error),
+        **live_routine_fields(schema_raw),
     )
