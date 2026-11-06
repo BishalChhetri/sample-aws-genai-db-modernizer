@@ -57,7 +57,11 @@ def _check(routine: MySqlRoutine, **kwargs: Any) -> RoutineVerdict:
 
 
 def _version_rules() -> list[RoutineCheckRule]:
-    return [r for r in routine_check_rules() if r.version_change is not None]
+    return [
+        r
+        for r in routine_check_rules()
+        if r.version_change is not None and "mysql" in r.source_engines
+    ]
 
 
 def _version_ids() -> set[str]:

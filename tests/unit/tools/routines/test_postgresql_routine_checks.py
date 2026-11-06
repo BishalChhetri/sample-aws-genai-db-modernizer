@@ -31,6 +31,8 @@ FUNCTION_RULES = (PARSE, LANGUAGE, EXTENSIONS, OWNERSHIP)
 
 
 def _verdict(r, line: str = "16", **kwargs) -> RoutineVerdict:
+    # A same-major source by default, so no version-change rule (#1951) is in the verdict.
+    kwargs.setdefault("source_version", f"{line}.1")
     return check_postgresql_routine(r, target_engine=TARGET, target_line=line, **kwargs)
 
 

@@ -1,0 +1,17 @@
+# Routine check postgresql-routine-v15-renamed-functions (#1951). Fields: src/shared/catalog/routine_checks.py.
+# Source: PostgreSQL 15 release notes, Migration to Version 15 (exclusive backup mode removed; pg_start_backup() and pg_stop_backup() renamed to pg_backup_start() and pg_backup_stop()).
+id = "postgresql-routine-v15-renamed-functions"
+feature = "A backup function PostgreSQL 15 renamed"
+source_engines = ["postgresql"]
+targets = ["aurora_postgresql"]
+kinds = ["function", "procedure"]
+impact = "needs_rewrite"
+reason = "PostgreSQL 15 removed the exclusive backup mode and renamed pg_start_backup() and pg_stop_backup() to pg_backup_start() and pg_backup_stop(), so on Aurora PostgreSQL 15 and later the call fails with an unknown function."
+fix_hint = "Drop the call: Aurora takes backups itself and does not let a database session run a base backup, so a routine that starts or stops one has no task left on Aurora."
+docs = "PostgreSQL 15 release notes, Migration to Version 15; Amazon Aurora User Guide, Backing up and restoring an Aurora DB cluster"
+
+[version_change]
+line = "15"
+
+[match]
+called_functions = ["pg_start_backup", "pg_stop_backup"]

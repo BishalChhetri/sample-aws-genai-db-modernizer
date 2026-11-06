@@ -560,11 +560,15 @@ def render_gaps_md(
 
 # The claim markers of the routine check section's sentences (#1935).
 _ROUTINE_TESTS = "tests/unit/tools/routines/test_postgresql_routine_checks.py::"
+_PG_VERSION_TESTS = "tests/unit/tools/routines/test_postgresql_version_change_checks.py::"
 _ROUTINE_SECTION_CLAIM = (
     _ROUTINE_TESTS + "test_a_clean_function_passes_every_rule_with_its_reason_and_fix_hint",
     _ROUTINE_TESTS + "test_a_routine_that_fails_several_rules_lists_each_one",
     _ROUTINE_TESTS + "test_the_metadata_checks_still_run_when_the_statement_does_not_parse",
     _ROUTINE_TESTS + "test_the_verdict_never_holds_the_routine_text",
+)
+_TARGET_CHOICE_CLAIM = (
+    _PG_VERSION_TESTS + "test_the_newest_line_is_an_option_and_same_major_stays_the_default",
 )
 _ROUTINE_LINE_CLAIM = (
     _ROUTINE_TESTS + "test_the_routines_line_is_the_one_the_gap_checks_move_lands_on",
@@ -596,6 +600,14 @@ _ROUTINE_CHECK_TEXT = {
     "dynamic_sql": (
         "a PREPARE from a user variable, whose text at run time no check can see (the string "
         "literals the routine assigns to it are checked)"
+    ),
+    "public_schema_create": (
+        "a body statement that creates a table, view, materialized view or sequence (not a "
+        "temporary one) in the public schema, by name or unqualified"
+    ),
+    "maintenance_search_path": (
+        "a function with no SET search_path clause of its own whose body names a table "
+        "without its schema"
     ),
     "dependencies": (
         "a table or routine the routine names that the step does not move, given the "
@@ -635,7 +647,20 @@ _ROUTINE_CHECK_CLAIMS = {
         _ROUTINE_TESTS + "test_a_definer_owned_by_a_role_or_an_invoker_owned_by_a_superuser_passes",
     ),
     "dependencies": _DEPENDENCY_CHECK_CLAIM,
+    "function_call": (_PG_VERSION_TESTS + "test_renamed_and_removed_functions",),
+    "catalog_column": (_PG_VERSION_TESTS + "test_removed_and_renamed_catalog_columns",),
+    "public_schema_create": (_PG_VERSION_TESTS + "test_creating_in_the_public_schema",),
+    "maintenance_search_path": (
+        _PG_VERSION_TESTS + "test_unqualified_tables_without_a_search_path_of_its_own",
+    ),
 }
+# A PostgreSQL version-change rule's row (#1951): when it runs, and a body not read.
+_PG_VERSION_CHANGE_CLAIM = (
+    _PG_VERSION_TESTS + "test_rules_never_run_on_a_same_major_target",
+    _PG_VERSION_TESTS + "test_each_rule_runs_only_from_a_source_older_than_its_line",
+    _PG_VERSION_TESTS + "test_an_unknown_source_version_leaves_the_rules_unknown_never_pass",
+    _PG_VERSION_TESTS + "test_a_body_that_is_not_read_is_unknown_never_pass",
+)
 
 
 # The MySQL checker's tests behind each MySQL rule's row (#1936), and its version-change
@@ -696,8 +721,18 @@ def _routine_check_text(rule: RoutineCheckRule) -> str:
     match = rule.match
     if match.check == "parse":
         return "; ".join(_ROUTINE_PARSE_TEXT[e] for e in rule.source_engines)
-    if match.check in _ROUTINE_CHECK_TEXT:
-        return _ROUTINE_CHECK_TEXT[match.check]
+    if match.check == "function_call":
+        return (
+            "a body call to " + _codes(match.called_functions) + " (unqualified or in "
+            "pg_catalog); a body that does not parse is unknown"
+        )
+    if match.check == "catalog_column":
+        return (
+            "a body statement that reads " + _codes(match.catalog_columns) + " (the catalog "
+            "relation unqualified or in pg_catalog); a body that does not parse is unknown"
+        )
+    if (text := _ROUTINE_CHECK_TEXT.get(match.check)) is not None:
+        return text
     if match.check == "definer":
         text = (
             "a DEFINER naming a user other than the target user (a CURRENT_USER form "
@@ -778,6 +813,8 @@ def _routine_check_claim(rule: RoutineCheckRule) -> str:
     a version-change rule, the tests of when it runs)."""
     if rule.source_engines == ("postgresql",):
         tests = _ROUTINE_CHECK_CLAIMS[rule.match.check]
+        if rule.version_change is not None:
+            return _claim((*tests, *_PG_VERSION_CHANGE_CLAIM))
     elif rule.source_engines == ("mysql",):
         tests = _MYSQL_ROUTINE_CHECK_CLAIMS[rule.match.check]
         if rule.match.check == "statement" and rule.version_change is not None:
@@ -808,7 +845,11 @@ def render_routine_checks_md(
         + " A rule with a version change (#1952) checks what a newer major version changed: "
         "it runs only when the source's version line is older than that version and the "
         "target line has it, so never on a same-major target, and its outcome is unknown, "
-        "never a pass, when the source's version is unknown." + _claim(_VERSION_CHANGE_CLAIM),
+        "never a pass, when the source's version is unknown."
+        + _claim((*_VERSION_CHANGE_CLAIM, *_PG_VERSION_CHANGE_CLAIM))
+        + " A PostgreSQL routine's target line is the newest listed Aurora PostgreSQL line "
+        "instead when the customer picks it (#1951); the same-major choice stays the "
+        "default." + _claim(_TARGET_CHOICE_CLAIM),
         "",
         "| Rule | Sources | Targets | Kinds | Impact | Checks |",
         "|---|---|---|---|---|---|",

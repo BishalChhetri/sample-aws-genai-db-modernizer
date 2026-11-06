@@ -79,7 +79,10 @@ ROUTINE_KINDS: tuple[RoutineKind, ...] = ("function", "procedure", "trigger", "e
 # What a rule checks, one per group of [match] keys:
 # - every engine: the routine's CREATE statement parses as its kind (``parse``);
 # - PostgreSQL: its language (``language``), the extensions it uses (``extensions``), its
-#   owner and security mode (``ownership``);
+#   owner and security mode (``ownership``), and in its body (#1951) the functions it calls
+#   (``function_call``), the catalog columns it reads (``catalog_column``), the objects it
+#   creates in the public schema (``public_schema_create``) and the tables it names with no
+#   search_path of its own (``maintenance_search_path``);
 # - MySQL: its DECLARE order (``declare_order``), its handlers (``handler``), its
 #   DEFINER (``definer``), the statements in its body (``statement``), its stored
 #   sql_mode (``sql_mode``), the dynamic SQL it prepares (``dynamic_sql``), the words it
@@ -100,6 +103,10 @@ RoutineCheck = Literal[
     "dynamic_sql",
     "reserved_word",
     "group_by",
+    "function_call",
+    "catalog_column",
+    "public_schema_create",
+    "maintenance_search_path",
     "dependencies",
 ]
 
@@ -107,6 +114,11 @@ RoutineCheck = Literal[
 # owner, security mode): no such rule applies to a trigger or an event (#1961 review).
 _OWN_METADATA_CHECKS: frozenset[RoutineCheck] = frozenset({"language", "ownership"})
 _OWN_METADATA_KINDS: frozenset[RoutineKind] = frozenset({"function", "procedure"})
+# The checks that read a PostgreSQL function's or procedure's body (#1951): a PostgreSQL
+# trigger's CREATE TRIGGER has none (its body is its trigger function's).
+_POSTGRESQL_BODY_CHECKS: frozenset[RoutineCheck] = frozenset(
+    {"function_call", "catalog_column", "public_schema_create", "maintenance_search_path"}
+)
 # The source engines whose checker implements each engine-specific check; ``parse`` is
 # every engine's. A rule naming a check for another engine fails at load time.
 _POSTGRESQL_FAMILY = frozenset({"postgresql"})
@@ -123,6 +135,10 @@ _CHECK_ENGINES: dict[RoutineCheck, frozenset[str]] = {
     "dynamic_sql": _MYSQL_FAMILY,
     "reserved_word": _MYSQL_FAMILY,
     "group_by": _MYSQL_FAMILY,
+    "function_call": _POSTGRESQL_FAMILY,
+    "catalog_column": _POSTGRESQL_FAMILY,
+    "public_schema_create": _POSTGRESQL_FAMILY,
+    "maintenance_search_path": _POSTGRESQL_FAMILY,
 }
 # Only MySQL has events (CREATE EVENT).
 _EVENT_ENGINES = _MYSQL_FAMILY
@@ -133,6 +149,7 @@ _ONE_LINE = r"^[^\n]+$"
 _LANGUAGE = re.compile(r"^[a-z][a-z0-9_]*$")
 _WORDS = re.compile(r"^[A-Z][A-Z0-9_]*( [A-Z][A-Z0-9_]*)*$")
 _VARIABLE = re.compile(r"^[a-z][a-z0-9_]*$")
+_CATALOG_COLUMN = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 _CONTEXT = re.compile(r"^(?:[A-Z][A-Z0-9_]*|\()(?: (?:[A-Z][A-Z0-9_]*|\())*$")
 
 
@@ -205,6 +222,22 @@ class RoutineCheckMatch(BaseModel):
     # ``with_direction``: a GROUP BY that sorts its columns (``ASC`` or ``DESC``) at any
     # level.
     group_by: Literal["without_order_by", "with_direction"] | None = None
+    # The PostgreSQL body checks (#1951) read the statements of a function's or procedure's
+    # body with PostgreSQL's parser (a PL/pgSQL body's SQL statements and expressions, a
+    # quoted SQL body, an SQL-standard body); a body that is not read is ``unknown``.
+    # function_call: a call to one of ``called_functions`` (lower case, unqualified or
+    # in pg_catalog) fails.
+    called_functions: tuple[str, ...] = ()
+    # catalog_column: a statement that reads one of ``catalog_columns``
+    # (``relation.column``, lower case: the relation unqualified or in pg_catalog, and a
+    # column of that name) fails.
+    catalog_columns: tuple[str, ...] = ()
+    # public_schema_create: a statement that creates a table, view, materialized view or
+    # sequence (not a temporary one) in the public schema, by name or unqualified, fails.
+    creates_in_public_schema: bool = False
+    # maintenance_search_path: a function with no SET search_path of its own whose body
+    # names a table without its schema fails.
+    unqualified_without_search_path: bool = False
     # dependencies (every engine, #1937): a table or routine the routine names that is not
     # in the set of objects moved in the same step fails.
     dependencies_moved_together: bool = False
@@ -247,6 +280,14 @@ class RoutineCheckMatch(BaseModel):
             found.append("reserved_word")
         if self.group_by is not None:
             found.append("group_by")
+        if self.called_functions:
+            found.append("function_call")
+        if self.catalog_columns:
+            found.append("catalog_column")
+        if self.creates_in_public_schema:
+            found.append("public_schema_create")
+        if self.unqualified_without_search_path:
+            found.append("maintenance_search_path")
         if self.dependencies_moved_together:
             found.append("dependencies")
         return found
@@ -258,7 +299,9 @@ class RoutineCheckMatch(BaseModel):
                 "[match] needs exactly one of parses, languages, extensions, "
                 "security_definer_owned_by_superuser, declare_order, valid_handlers, "
                 "definer_not_target_user, a statement list, sql_modes, unknown_sql_modes, "
-                "dynamic_sql, reserved_words, group_by or dependencies_moved_together"
+                "dynamic_sql, reserved_words, group_by, called_functions, catalog_columns, "
+                "creates_in_public_schema, unqualified_without_search_path or "
+                "dependencies_moved_together"
             )
         if self.trusted_extension_languages and not self.languages:
             raise ValueError("trusted_extension_languages goes with languages")
@@ -288,6 +331,8 @@ class RoutineCheckMatch(BaseModel):
             "sql_modes": (*self.sql_modes, *self.known_sql_modes),
             "reserved_words": self.reserved_words,
             "reserved_word_contexts": self.reserved_word_contexts,
+            "called_functions": self.called_functions,
+            "catalog_columns": self.catalog_columns,
         }
         for key, values in lists.items():
             if len(set(values)) != len(values):
@@ -305,6 +350,12 @@ class RoutineCheckMatch(BaseModel):
         for word in keywords:
             if not _WORDS.match(word):
                 raise ValueError(f"{word!r}: keywords and modes are upper case, single-spaced")
+        for name in self.called_functions:
+            if not _VARIABLE.match(name):
+                raise ValueError(f"{name!r}: a function name is lower case")
+        for column in self.catalog_columns:
+            if not _CATALOG_COLUMN.match(column):
+                raise ValueError(f"{column!r}: a catalog column is relation.column, lower case")
         for variable in (*self.set_variables, *self.system_variables):
             if not _VARIABLE.match(variable):
                 raise ValueError(f"{variable!r}: a system variable name is lower case")
@@ -370,6 +421,15 @@ class RoutineCheckRule(BaseModel):
                         f"a {self.match.check} rule cannot apply to a {kind}: only a function "
                         "or procedure has a language, owner and security mode of its own"
                     )
+        if self.match.check in _POSTGRESQL_BODY_CHECKS:
+            for kind in self.kinds:
+                if kind not in _OWN_METADATA_KINDS:
+                    raise ValueError(
+                        f"a {self.match.check} rule cannot apply to a {kind}: it reads a "
+                        "function's or procedure's body"
+                    )
+        if self.match.check == "maintenance_search_path" and self.kinds != ("function",):
+            raise ValueError("a maintenance_search_path rule applies to functions only")
         if "event" in self.kinds and (stray := sorted(set(self.source_engines) - _EVENT_ENGINES)):
             raise ValueError(f"only MySQL has events; kinds lists event for {stray}")
         if self.version_change is not None:
